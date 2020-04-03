@@ -1,0 +1,175 @@
+---
+title: "Week 4 ML Project"
+author: "Sam Channon-Wells"
+date: "02/04/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Intro
+
+We first load the caret package, and the training and test data. I am calling the test set the "validation" set, since I will split the training set up into a training set and a test set. This will allow me train multiple models on the training set, and then pick the best ones by looking at performance in the test set.
+
+We remove variables that have any NAs, or have more than 50% empty values (" "). These variables are less useful for prediction. I have also removed the time variables, as I think these are less helpful to predict on, since we want to know what type of activity is being pursued regardless of time of day.
+
+We then split the training data into a training set (80%) and test set (20%), using a seeded random process.
+
+
+```{r data}
+library(caret)
+train <- read.csv("pml-training.csv")[, -1]
+val <- read.csv("pml-testing.csv")[, -1]
+
+n <- nrow(train)
+vars <- c(1:159)
+vars <- vars[!(vars %in% c(1:6, 159))]
+rem <- NULL
+for (i in vars) {
+  if(sum(is.na(train[, i])) > 0) {
+    rem <- c(rem, i)
+  }
+}
+vars <- vars[!(vars %in% rem)]  # We have selected variables that have no NAs to train our model on
+
+rem <- NULL
+for (i in vars) {
+  if (sum(train[, i] == "") > n*.5) {
+    rem <- c(rem, i)
+  }  
+}
+vars <- vars[!(vars %in% rem)] # We have selected variables without lots of empty values
+
+set.seed(874)
+inTrain <- createDataPartition(train$classe, p = 0.8)[[1]]
+training <- train[ inTrain,]
+testing <- train[-inTrain,]
+
+```
+
+## Training algorithm
+
+First I train five different models.
+
+ - random forest method with 10-fold cross-validation (10fcv)
+ - gradient boosting with 10fcv
+ - elastic net with 10fcv, using two separate implementations
+ - combined model, training random forest on the predictions in the test set from the above models (excluding the worst elastic net method)
+ 
+I then tabulate the accuracy of each method in the training and test sets.
+
+From this we see that the best method in both training and test sets is the random forest model, which we will later use to validate our results.
+
+```{r training, echo = FALSE}
+set.seed(399)
+library(ranger)
+
+RUN <- FALSE
+
+if (RUN) {
+  # Model training:
+  mf1 <- train(data = training[, c(vars, 159)], classe ~., method = "ranger",
+               trControl = trainControl(method = "cv", number = 10),
+               tuneGrid = expand.grid(mtry = seq(from = 10, to = 50, by = 8), splitrule = c("gini", "extratrees"), min.node.size = 1))
+  trainpred.rf <- predict(mf1, training)
+  testpred.rf <- predict(mf1, testing)
+  
+  mf2 <- train(data = training[, c(vars, 159)], classe ~., method = "gbm",
+               trControl = trainControl(method = "cv", number = 10))
+  trainpred.gbm <- predict(mf2, training)
+  testpred.gbm <- predict(mf2, testing)
+  
+  lambda <- 10^seq(-3, 3, length = 100)
+  mf3 <- train(data = training[, c(vars, 159)], classe ~., method = "glmnet",
+               trControl = trainControl(method = "cv", number = 10),
+               tuneGrid = expand.grid(alpha = 0.5, lambda = lambda))
+  trainpred.el1 <- predict(mf3, training)
+  testpred.el1 <- predict(mf3, testing)
+  
+  
+  mf4 <- train(data = training[, c(vars, 159)], classe ~., method = "glmnet",
+               trControl = trainControl(method = "cv", number = 10),
+               tuneLength = 10)
+  trainpred.el2 <- predict(mf4, training)
+  testpred.el2 <- predict(mf4, testing)
+  
+  predrfval <- predict(mf1, val)
+  
+  dat1 <- data.frame(trainpred.rf,
+                    trainpred.gbm,
+                    trainpred.el1,
+                    trainpred.el2)
+  dat2 <- data.frame(testpred.rf,
+                    testpred.gbm,
+                    testpred.el1,
+                    testpred.el2)
+  dat3 <- data.frame(predrfval)
+  write.csv(dat1, "trainingpreds.csv")
+  write.csv(dat2, "testingpreds.csv")
+  write.csv(dat3, "valpreds.csv")
+}
+
+if (!RUN) {
+  dat1 <- read.csv("trainingpreds.csv")[, -1]
+  dat2 <- read.csv("testingpreds.csv")[, -1]
+  dat3 <- read.csv("valpreds.csv")[, -1]
+  trainpred.rf <- dat1$trainpred.rf
+  testpred.rf <- dat2$testpred.rf
+  trainpred.gbm <- dat1$trainpred.gbm
+  testpred.gbm <- dat2$testpred.gbm
+  trainpred.el1 <- dat1$trainpred.el1
+  testpred.el1 <- dat2$testpred.el1
+  trainpred.el2 <- dat1$trainpred.el2
+  testpred.el2 <- dat2$testpred.el2
+  predrfval <- dat3
+}
+
+pred <- data.frame(testpred.rf, testpred.gbm, testpred.el2, classe = testing$classe)
+combmf <- train(classe ~. , data = pred, method = "rf")
+testcomb <- predict(combmf, pred)
+
+# Predicting with models:
+rftrain <- trainpred.rf == training$classe
+rftest <- testpred.rf == testing$classe
+gbmtrain <- trainpred.gbm == training$classe
+gbmtest <- testpred.gbm == testing$classe
+el1train <- trainpred.el1 == training$classe
+el1test <- testpred.el1 == testing$classe
+el2train <- trainpred.el2 == training$classe
+el2test <- testpred.el2 == testing$classe
+combtest <- testcomb == testing$classe
+
+# Accuracy:
+library(formattable)
+accuracy <- as.data.frame(matrix(0, nrow = 9, ncol = 3))
+colnames(accuracy) <- c("group", "model", "accuracy")
+accuracy$group <- c(rep("training", 4), rep("testing", 5))
+accuracy$model <- c(rep(c("random forest", "gradient boosting", "elastic net 1", "elastic net 2"), 2), "combined model")
+accuracy$accuracy[1] <- 100*sum(rftrain)/length(rftrain)
+accuracy$accuracy[2] <- 100*sum(gbmtrain)/length(gbmtrain)
+accuracy$accuracy[3] <- 100*sum(el1train)/length(el1train)
+accuracy$accuracy[4] <- 100*sum(el2train)/length(el2train)
+accuracy$accuracy[5] <- 100*sum(rftest)/length(rftest)
+accuracy$accuracy[6] <- 100*sum(gbmtest)/length(gbmtest)
+accuracy$accuracy[7] <- 100*sum(el1test)/length(el1test)
+accuracy$accuracy[8] <- 100*sum(el2test)/length(el2test)
+accuracy$accuracy[9] <- 100*sum(combtest)/length(combtest)
+accuracy
+
+```
+
+
+## Validating model
+
+The best model in the above test set was the random forest model, which had an out-of-sample accuracy of 99.5%.
+
+Even combining the other models did not improve this accuracy. We therefore have picked the random forest model as out prediction model of choice, and we now evaluate it's performance in the 20 test samples we were given.The predictions are given below, and in the grader the prediction accuracy is 100%. Good news for the random forest!
+
+``` {r validation }
+
+data.frame(id = c(1:20), prediction = predrfval)
+
+```
+
